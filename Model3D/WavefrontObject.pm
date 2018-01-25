@@ -4,9 +4,10 @@ use 5.006;
 use strict;
 
 our($VERSION);
-$VERSION = 1.00;
+$VERSION = 1.11;
 
 use Math::Trig;
+#use Math::Geometry::Planar;
 
 sub new {
     my $p = shift;
@@ -44,22 +45,65 @@ sub ReadObj {
     $obj->{objfile} = shift;
 
     unless ($obj->{objfile} and $obj->{objfile} =~ /\.obj$/i) {
-        $obj->{objfile} = "$obj->{objfile}.OBJ" if -e "$obj->{objfile}.OBJ" and not -d "$obj->{objfile}.OBJ"; # Zbrush is dumb
-        $obj->{objfile} = "$obj->{objfile}.obj" if -e "$obj->{objfile}.obj" and not -d "$obj->{objfile}.obj"; # Pref for lower
+        $obj->{objfile} = "$obj->{objfile}.OBJ"
+           if -e "$obj->{objfile}.OBJ"
+          and not -d "$obj->{objfile}.OBJ"; # Zbrush is dumb
+        $obj->{objfile} = "$obj->{objfile}.obj"
+           if -e "$obj->{objfile}.obj"
+          and not -d "$obj->{objfile}.obj"; # Pref for lower
     }
-    $obj->{errstr} = "$obj->{objfile}: No such file or directory." and return undef unless -e $obj->{objfile};
-    $obj->{errstr} = "$obj->{objfile}: is a directory." and return undef if -d $obj->{objfile};
-    $obj->{errstr} = "$obj->{objfile}: File is zero size." and return undef unless -s $obj->{objfile};
-    $obj->{errstr} = "$obj->{objfile}: Cannot modify. Check permissions." and return undef unless -w $obj->{objfile};
+
+    $obj->{errstr} = "$obj->{objfile}: No such file or directory."
+         and return undef
+      unless -e $obj->{objfile};
+
+    $obj->{errstr} = "$obj->{objfile}: is a directory."
+      and return undef
+       if -d $obj->{objfile};
+
+    $obj->{errstr} = "$obj->{objfile}: File is zero size."
+         and return undef
+      unless -s $obj->{objfile};
+
+    unless ($obj->{_readonly}) {
+        $obj->{errstr} = "$obj->{objfile}: Cannot modify. Check permissions."
+             and return undef
+          unless -w $obj->{objfile};
+    }
 
     my $OBJ;
-    $obj->{errstr} = "Can't read $obj->{objfile}: $!" and return undef unless open $OBJ, $obj->{objfile};
+    $obj->{errstr} = "Can't read $obj->{objfile}: $!"
+         and return undef
+      unless open $OBJ, $obj->{objfile};
     # File is OK and open and we're reading it now.
+
+    return $obj->_readObjData($OBJ);
+}
+
+sub ReadData {
+    my $obj = shift;
+    my $data;
+    {
+        no warnings; #fuck your stupid =/== error, perl, you are wrong.
+        $data = shift # assign this. WHICH I MEAN TO GOD DAMNED DO
+           or $obj->{errstr} = "Empty data string" # OR ASSIGN THIS.
+          and return undef; # then return undef. LIKE I DAMNED SAID.
+    }
+    $obj->{objfile} = '__STRING_DATA__';
+
+    open my $OBJ, "<", \$data;
+    return $obj->_readObjData($OBJ);
+}
+
+sub _readObjData {
+    my $obj = shift;
+    my $OBJ = shift;
 
     my $void = 1;
     my $vpid = 0;
     my $vtoid = 1;
     my $vnoid = 1;
+
     while (<$OBJ>) {
         chomp;
         s/\r//;
@@ -79,13 +123,17 @@ sub ReadObj {
                       pid => $vpid };
 
             push @{$obj->{v}}, $v;
-            for my $prec (1..10) {
-                my $fmt = "X(%.${prec}f)Y(%.${prec}f)Z(%.${prec}f)";
-                my $vid = sprintf $fmt, $x, $y, $z;
-                $obj->{vpos}->{$prec}->{$vid} ||= [];
-                push @{$obj->{vpos}->{$prec}->{$vid}}, $v;
-                $v->{vpos}->{$prec} = $vid;
+
+            unless ($obj->{_no_calc_vpos}) {
+                for my $prec (1 .. $obj->{_max_vpos_precision} || 10) {
+                    my $fmt = "X(%.${prec}f)Y(%.${prec}f)Z(%.${prec}f)";
+                    my $vid = sprintf $fmt, $x, $y, $z;
+                    $obj->{vpos}->{$prec}->{$vid} ||= [];
+                    push @{$obj->{vpos}->{$prec}->{$vid}}, $v;
+                    $v->{vpos}->{$prec} = $vid;
+                }
             }
+
             $void++;
             $vpid++;
         }
@@ -192,15 +240,17 @@ sub ReadObj {
             }
             my $pid = join ';', @pid;
 
-            my $f = {verts => \@p,
-                     group => $obj->{_group},
-                     material => $obj->{_material},
-                     region => $obj->{_region},
-                     pid => $pid};
+            my $f = { verts => \@p,
+                      group => $obj->{_group},
+                      material => $obj->{_material},
+                      region => $obj->{_region},
+                      pid => $pid,
+                      opid => join ';', sort { $a <=> $b } @pid };
 
             push @{$obj->{f}}, $f;
             $f->{id} = scalar @{$obj->{f}};
             $obj->{pid}->{$pid} = $f;
+            $obj->{opid}->{join ';', sort { $a <=> $b } @pid} = $f;
 
             # Theoretically, you can now get the x, y, and z coordinates and
             # UV coordinates and group and material for, say, the third vertex
@@ -371,6 +421,115 @@ sub FindEdges {
     }
 }
 
+sub calcVertexFacets {
+    my $obj = shift;
+    for my $f (@{$obj->{f}}) {
+        for my $v (@{$f->{verts}}) {
+            $v->{v}->{f}->{$f->{id} - 1} = $f;
+        }
+    }
+
+    $obj->{_f} = 1;
+}
+
+sub calcSurfaceNormals {
+    my $obj = shift;
+
+    for my $f (@{$obj->{f}}) {
+        for my $i (0..$#{$f->{verts}}) {
+            my $j = $i + 1 > $#{$f->{verts}} ? 0 : $i + 1;
+            $f->{n}->{x} +=   ($f->{verts}->[$i]->{v}->{z} + $f->{verts}->[$j]->{v}->{z})
+                            * ($f->{verts}->[$j]->{v}->{y} - $f->{verts}->[$i]->{v}->{y});
+            $f->{n}->{y} +=   ($f->{verts}->[$i]->{v}->{x} + $f->{verts}->[$j]->{v}->{x})
+                            * ($f->{verts}->[$j]->{v}->{z} - $f->{verts}->[$i]->{v}->{z});
+            $f->{n}->{z} +=   ($f->{verts}->[$i]->{v}->{y} + $f->{verts}->[$j]->{v}->{y})
+                            * ($f->{verts}->[$j]->{v}->{x} - $f->{verts}->[$i]->{v}->{x});
+        }
+
+        if (@{$f->{verts}} == 4) {
+            $f->{n}->{$_} /= 2 for qw(x y z);
+        }
+    }
+
+    $obj->{_n} = 1;
+}
+
+sub calcPolyAreas {
+    my $obj = shift;
+
+    for my $f (@{$obj->{f}}) {
+        my @tris = ([$f->{verts}->[0], $f->{verts}->[1], $f->{verts}->[2]]);
+        push @tris, [$f->{verts}->[2], $f->{verts}->[3], $f->{verts}->[0]] if @{$f->{verts}} == 4;
+        $f->{area} += $obj->getTriArea($_) for @tris;
+    }
+
+    $obj->{_fa} = 1;
+}
+
+sub calcVertexAreas {
+    my $obj = shift;
+    $obj->calcPolyAreas unless $obj->{_fa};
+    $obj->calcVertexFacets unless $obj->{_f};
+
+    for my $v (@{$obj->{v}}) {
+        for my $f (keys %{$v->{f}}) {
+            $v->{area} += $v->{f}->{$f}->{area};
+        }
+    }
+}
+
+sub getTriArea {
+    my $obj = shift;
+    my ($a, $b, $c) = @{shift()};
+    return $obj->areaFromLengths(
+        $obj->getDistance($a->{v}, $b->{v}),
+        $obj->getDistance($b->{v}, $c->{v}),
+        $obj->getDistance($c->{v}, $a->{v}));
+}
+
+sub getDistance {
+    my $obj = shift;
+    my ($a, $b) = @_;
+    return sqrt(($a->{x} - $b->{x}) ** 2 + ($a->{y} - $b->{y}) ** 2 + ($a->{z} - $b->{z}) ** 2);
+}
+
+sub areaFromLengths {
+    my $obj = shift;
+    my ($a, $b, $c) = @_;
+    my $s = ($a + $b + $c) / 2;
+    return sqrt($s * ($s - $a) * ($s - $b) * ($s - $c));
+}
+
+sub calcVertexNormals {
+    my $obj = shift;
+    $obj->calcSurfaceNormals unless $obj->{_n};
+    $obj->calcVertexFacets unless $obj->{_f};
+
+    for my $v (@{$obj->{v}}) {
+        next unless scalar keys %{$v->{f}};
+        for my $f (keys %{$v->{f}}) {
+            $v->{vn}->{$_} += $v->{f}->{$f}->{n}->{$_} for qw(x y z);
+        }
+        $v->{vn}->{$_} /= scalar keys %{$v->{f}} for qw(x y z);
+        $v->{vn}->{$_} = sprintf '%.6f', $v->{vn}->{$_} for qw(x y z);
+    }
+}
+
+sub readVertexNormals {
+    my $obj = shift;
+    for my $f (@{$obj->{f}}) {
+        $_->{v}->{fn}->{$f->{id}} = $_->{vn} for @{$f->{verts}};
+    }
+    for my $v (@{$obj->{v}}) {
+        for my $fn (keys %{$v->{fn}}) {
+            $v->{vn}->{x} += $v->{fn}->{$fn}->{i};
+            $v->{vn}->{y} += $v->{fn}->{$fn}->{j};
+            $v->{vn}->{z} += $v->{fn}->{$fn}->{k};
+        }
+        $v->{vn}->{$_} /= scalar keys %{$v->{fn}} for qw(x y z);
+    }
+}
+
 sub Translate {
     my $obj = shift;
     my $trans;
@@ -480,23 +639,21 @@ sub GetApparentCentre {
 
 sub MinMax {
     my $obj = shift;
-    my $max = {x => undef,
-               y => undef,
-               z => undef};
-    my $min = {x => undef,
-               y => undef,
-               z => undef};
+    my $max = {x => -999999999,
+               y => -999999999,
+               z => -999999999};
+    my $min = {x => 999999999,
+               y => 999999999,
+               z => 999999999};
     return ($min, $max) unless scalar @{$obj->{v}};
-
     for my $v (@{$obj->{v}}) {
-        $max->{x} = $v->{x} if $v->{x} > $max->{x} or not defined $max->{x};
-        $min->{x} = $v->{x} if $v->{x} < $min->{x} or not defined $min->{x};
-        $max->{y} = $v->{y} if $v->{y} > $max->{y} or not defined $max->{y};
-        $min->{y} = $v->{y} if $v->{y} < $min->{y} or not defined $min->{y};
-        $max->{z} = $v->{z} if $v->{z} > $max->{z} or not defined $max->{z};
-        $min->{z} = $v->{z} if $v->{z} < $min->{z} or not defined $min->{z};
+        $max->{x} = $v->{x} if $v->{x} > $max->{x};
+        $min->{x} = $v->{x} if $v->{x} < $min->{x};
+        $max->{y} = $v->{y} if $v->{y} > $max->{y};
+        $min->{y} = $v->{y} if $v->{y} < $min->{y};
+        $max->{z} = $v->{z} if $v->{z} > $max->{z};
+        $min->{z} = $v->{z} if $v->{z} < $min->{z};
     }
-
     return ($min, $max);
 }
 
