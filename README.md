@@ -1,2 +1,2 @@
 # Model3D-WavefrontObject
-I just need to get this up to date for CPAN, and git's merge tools will help.
+Licensed under the Perl Artistic License 2.0 http://www.perlfoundation.org/artistic_license_2_0
